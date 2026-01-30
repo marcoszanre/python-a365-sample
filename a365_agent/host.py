@@ -306,7 +306,11 @@ class GenericAgentHost(NotificationHandlerMixin):
                         logger.warning(f"⚠️ Email timeout after {self.EMAIL_NOTIFICATION_TIMEOUT}s")
                         response = "Thank you for your email. I'm still processing and will follow up."
                     
-                    await safe_send_email_response(context, response)
+                    # Only send a response if there is one (empty = system notification, ignore)
+                    if response and response.strip():
+                        await safe_send_email_response(context, response)
+                    else:
+                        logger.info("📧 No response needed (system notification ignored)")
                     
             except Exception as e:
                 logger.error(f"❌ Email notification error: {e}")

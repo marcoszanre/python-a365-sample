@@ -251,30 +251,94 @@ When you receive Word/Excel/PowerPoint comment notifications:
     # NOTIFICATION HANDLERS
     # =========================================================================
     
-    def _is_comment_notification_email(self, context: TurnContext) -> bool:
-        """Check if this email is just a notification about a document comment (duplicate)."""
-        # Check if it's from the email channel but contains document comment indicators
+    def _is_system_generated_email(self, context: TurnContext) -> bool:
+        """
+        Check if this email is a system-generated notification that should be IGNORED.
+        
+        System notifications include:
+        - Site/document sharing notifications
+        - Comment mention notifications (handled separately via Word/Excel/PowerPoint)
+        - Calendar invites from the system
+        - Any automated Microsoft 365 notification
+        """
         subject = ""
         if context.activity.conversation:
             subject = getattr(context.activity.conversation, "topic", "") or ""
+        subject_lower = subject.lower()
         
-        # These are notification emails about document comments - we already handle the actual comment
-        # Check for patterns like "mentioned you in" which indicate it's a notification email
-        if "mentioned you in" in subject.lower():
-            # Check if there's a wpxcomment or document reference in the HTML that indicates
-            # this is a notification about a comment we'll get separately
-            entities = getattr(context.activity, "entities", []) or []
-            for entity in entities:
-                entity_type = getattr(entity, "type", "") if hasattr(entity, "type") else entity.get("type", "")
-                if entity_type == "emailNotification":
-                    html_body = ""
-                    if hasattr(entity, "htmlBody"):
-                        html_body = entity.htmlBody
-                    elif isinstance(entity, dict):
-                        html_body = entity.get("htmlBody", "")
-                    
-                    # If the HTML contains "Go to comment" it's a notification email about a document comment
-                    if html_body and "Go to comment" in html_body:
+        text_content = getattr(context.activity, "text", "") or ""
+        text_lower = text_content.lower()
+        
+        # Get HTML body for pattern matching
+        html_body = ""
+        entities = getattr(context.activity, "entities", []) or []
+        for entity in entities:
+            entity_type = getattr(entity, "type", "") if hasattr(entity, "type") else entity.get("type", "")
+            if entity_type == "emailNotification":
+                if hasattr(entity, "htmlBody"):
+                    html_body = entity.htmlBody or ""
+                elif isinstance(entity, dict):
+                    html_body = entity.get("htmlBody", "") or ""
+                break
+        html_lower = html_body.lower()
+        
+        # Patterns that indicate system-generated notifications
+        system_patterns = [
+            # Sharing notifications
+            "shared with you",
+            "compartilhou com você",
+            "convidou você para",
+            "invited you to",
+            "has shared",
+            "gave you access",
+            "deu acesso",
+            
+            # Comment mention notifications (duplicates - handled by Word/Excel/PPT handlers)
+            "mentioned you in",
+            "mencionou você",
+            "go to comment",
+            "ir para comentário",
+            
+            # Site/Team notifications
+            "follow this site",
+            "siga este site",
+            "you've been added to",
+            "você foi adicionado",
+            "welcome to the team",
+            
+            # Document notifications
+            "document is ready",
+            "shared a file",
+            "shared a folder",
+            "compartilhou um arquivo",
+            "compartilhou uma pasta",
+            
+            # Calendar system notifications (not actual invites from people)
+            "your meeting was updated",
+            "meeting canceled",
+            "reunião foi atualizada",
+            "reunião cancelada",
+        ]
+        
+        # Check all text fields for system patterns
+        all_text = f"{subject_lower} {text_lower} {html_lower}"
+        for pattern in system_patterns:
+            if pattern in all_text:
+                return True
+        
+        # Check for SharePoint/OneDrive system URLs in HTML (indicates automated notification)
+        if html_body:
+            sharepoint_patterns = [
+                "sharepoint.com/sites/",
+                "sharepoint.com/personal/",
+                "-my.sharepoint.com/",
+                "FollowSite=1",  # SharePoint follow button
+            ]
+            for pattern in sharepoint_patterns:
+                if pattern in html_body and "go to comment" not in html_lower:
+                    # If it has SharePoint links but isn't a comment notification
+                    # Check if it seems like a sharing/access notification
+                    if any(x in all_text for x in ["shared", "compartilh", "access", "acesso", "convid", "invited"]):
                         return True
         
         return False
@@ -286,23 +350,28 @@ When you receive Word/Excel/PowerPoint comment notifications:
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Handle email notifications intelligently using AI to decide the best response."""
+        """Handle email notifications - IGNORE system-generated, process real emails."""
         try:
             logger.info("📧 Processing email notification")
             
-            # Check if this is a duplicate notification email about a document comment
-            if self._is_comment_notification_email(context):
-                logger.info("📧 Skipping duplicate comment notification email (handled via document comment)")
-                return "This notification has been noted."
+            # Check if this is a system-generated notification (shares, mentions, etc.)
+            if self._is_system_generated_email(context):
+                subject = ""
+                if context.activity.conversation:
+                    subject = getattr(context.activity.conversation, "topic", "") or ""
+                logger.info(f"📧 Ignoring system-generated email notification: '{subject[:50]}...'")
+                return ""  # Return empty - don't send any reply
             
-            # Extract email data
+            # Extract email data for real emails
             sender_email = ""
+            sender_name = ""
             subject = ""
             text_content = getattr(context.activity, "text", "") or ""
             html_body = ""
             
             if context.activity.from_property:
                 sender_email = getattr(context.activity.from_property, "id", "") or ""
+                sender_name = getattr(context.activity.from_property, "name", "") or ""
             
             if context.activity.conversation:
                 subject = getattr(context.activity.conversation, "topic", "") or ""
@@ -321,21 +390,22 @@ When you receive Word/Excel/PowerPoint comment notifications:
             # Use the best available content
             email_content = html_body[:3000] if html_body else text_content[:3000]
             
-            logger.info(f"📧 From: {sender_email}, Subject: {subject}")
+            logger.info(f"📧 Real email from {sender_name} ({sender_email}): '{subject[:50]}...'")
             
             # Initialize MCP for full tool access
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
             # Let the AI decide what to do based on the email content
-            message = f"""You received an email. Analyze it and respond appropriately.
+            message = f"""You received a real email from a person. Analyze it and respond appropriately.
 
-FROM: {sender_email}
+FROM: {sender_name} <{sender_email}>
 SUBJECT: {subject}
 
 EMAIL CONTENT:
 {email_content}
 
 INSTRUCTIONS:
+- This is a real email from a human, not a system notification
 - Analyze what the sender is asking or telling you
 - If they're asking a question, answer it directly
 - If they're asking you to do something (send email, schedule meeting, look up info, etc.), USE YOUR TOOLS to do it

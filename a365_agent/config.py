@@ -175,12 +175,29 @@ class Settings:
     
     def configure_logging(self) -> None:
         """Configure logging based on settings."""
-        logging.basicConfig(level=getattr(logging, self.log_level))
+        # Use a cleaner format that shows what matters
+        logging.basicConfig(
+            level=getattr(logging, self.log_level),
+            format="%(levelname)s:%(name)s:%(message)s"
+        )
         
         # Suppress verbose Azure SDK logging
         logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
         logging.getLogger("azure.identity").setLevel(logging.ERROR)
         logging.getLogger("microsoft_agents_a365.observability").setLevel(logging.ERROR)
+        
+        # Suppress noisy Microsoft Agents SDK loggers (typing indicators, token attempts, etc.)
+        logging.getLogger("microsoft_agents.hosting.core.connector.client.connector_client").setLevel(logging.WARNING)
+        logging.getLogger("microsoft_agents.authentication.msal.msal_auth").setLevel(logging.WARNING)
+        logging.getLogger("microsoft_agents.hosting.core.rest_channel_service_client_factory").setLevel(logging.WARNING)
+        logging.getLogger("microsoft_agents.hosting.core.app.oauth._handlers.agentic_user_authorization").setLevel(logging.WARNING)
+        
+        # Suppress HTTP request logging (httpx, aiohttp)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+        
+        # Suppress MCP protocol noise (session IDs, stream reconnects)
+        logging.getLogger("mcp.client.streamable_http").setLevel(logging.WARNING)
 
 
 # Global singleton settings instance
