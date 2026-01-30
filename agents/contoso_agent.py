@@ -13,14 +13,12 @@ from typing import Optional
 
 from a365_agent.auth import LocalAuthOptions
 from a365_agent.base import AgentBase
-from a365_agent.config import get_settings
+from a365_agent.config import get_settings, AzureOpenAIModelConfig
 from a365_agent.mcp import MCPService
 from a365_agent.observability import enable_agentframework_instrumentation
 
 from agent_framework import ChatAgent
 from agent_framework.azure import AzureOpenAIChatClient
-from azure.core.credentials import AzureKeyCredential
-from azure.identity import AzureCliCredential
 from microsoft_agents.hosting.core import Authorization, TurnContext
 
 logger = logging.getLogger(__name__)
@@ -127,6 +125,9 @@ When you receive Word/Excel/PowerPoint comment notifications:
         # Enable instrumentation
         enable_agentframework_instrumentation()
         
+        # Current model tracking for failover
+        self.current_model: Optional[AzureOpenAIModelConfig] = None
+        
         # Initialize components
         self._create_chat_client()
         self._create_agent()
@@ -137,30 +138,38 @@ When you receive Word/Excel/PowerPoint comment notifications:
         # Track MCP initialization state
         self.mcp_servers_initialized = False
     
-    def _create_chat_client(self) -> None:
-        """Create the Azure OpenAI chat client with retry configuration."""
-        settings = self.settings.azure_openai
-        settings.validate()
+    def _create_chat_client(self, model_config: Optional[AzureOpenAIModelConfig] = None) -> None:
+        """
+        Create the Azure OpenAI chat client with retry configuration.
         
-        if settings.api_key:
-            credential = AzureKeyCredential(settings.api_key)
-            logger.info("Using API key authentication for Azure OpenAI")
+        Args:
+            model_config: Optional specific model to use. If None, uses model pool.
+        """
+        if model_config:
+            # Use specific model config (for failover)
+            self.current_model = model_config
+        elif self.settings.model_pool and len(self.settings.model_pool) > 0:
+            # Use model pool for load balancing
+            self.current_model = self.settings.model_pool.get_next_model()
         else:
-            credential = AzureCliCredential()
-            logger.info("Using Azure CLI authentication for Azure OpenAI")
+            # Fallback to legacy single-model config
+            settings = self.settings.azure_openai
+            settings.validate()
+            self.current_model = AzureOpenAIModelConfig(
+                endpoint=settings.endpoint,
+                deployment=settings.deployment,
+                api_key=settings.api_key or "",
+                api_version=settings.api_version,
+            )
         
-        # Configure retry behavior for rate limiting (429 errors)
-        # The OpenAI SDK has built-in retry with exponential backoff
+        # Create the chat client with API key authentication
         self.chat_client = AzureOpenAIChatClient(
-            endpoint=settings.endpoint,
-            credential=credential,
-            deployment_name=settings.deployment,
-            api_version=settings.api_version,
-            # Retry configuration for 429 Too Many Requests
-            max_retries=5,  # Default is 2, increase for rate limiting
-            timeout=120.0,  # Increase timeout to allow for retries
+            endpoint=self.current_model.endpoint,
+            api_key=self.current_model.api_key,
+            deployment_name=self.current_model.deployment,
+            api_version=self.current_model.api_version,
         )
-        logger.info("✅ Azure OpenAI client created (max_retries=5, timeout=120s)")
+        logger.info(f"🤖 Using model: {self.current_model.name}")
     
     def _create_agent(self) -> None:
         """Create the AgentFramework agent."""
@@ -218,6 +227,73 @@ When you receive Word/Excel/PowerPoint comment notifications:
             return str(result.content)
         return str(result)
     
+    async def _run_with_failover(self, message: str, max_retries: int = 3) -> str:
+        """
+        Run agent with automatic failover to other models on rate limiting (429).
+        
+        Args:
+            message: The message to process
+            max_retries: Maximum number of failover attempts
+            
+        Returns:
+            The agent's response
+        """
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                result = await self.agent.run(message)
+                
+                # Success - clear any throttle on current model
+                if self.settings.model_pool and self.current_model:
+                    self.settings.model_pool.clear_throttle(self.current_model)
+                
+                return self._extract_result(result) or "I couldn't process your request."
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                last_error = e
+                
+                # Check if it's a rate limiting error (429)
+                is_rate_limit = (
+                    "429" in error_str or 
+                    "rate limit" in error_str or 
+                    "too many requests" in error_str or
+                    "retry" in error_str
+                )
+                
+                if is_rate_limit and self.settings.model_pool and len(self.settings.model_pool) > 1:
+                    # Mark current model as throttled
+                    if self.current_model:
+                        # Extract retry-after if present, default to 60s
+                        retry_after = 60.0
+                        if "retry" in error_str:
+                            # Try to extract seconds from error message
+                            import re
+                            match = re.search(r'(\d+\.?\d*)\s*second', error_str)
+                            if match:
+                                retry_after = float(match.group(1))
+                        
+                        self.settings.model_pool.mark_throttled(self.current_model, retry_after)
+                    
+                    # Get next available model
+                    available = self.settings.model_pool.available_count
+                    logger.warning(f"🔄 Rate limited! Failover attempt {attempt + 1}/{max_retries}. Available models: {available}/{len(self.settings.model_pool)}")
+                    
+                    # Switch to next model
+                    self._create_chat_client()
+                    self._create_agent()
+                    
+                    # Small delay before retry
+                    await asyncio.sleep(0.5)
+                else:
+                    # Not a rate limit error, or no failover available
+                    raise
+        
+        # All retries exhausted
+        logger.error(f"All {max_retries} failover attempts failed")
+        raise last_error or Exception("All models failed")
+    
     # =========================================================================
     # MESSAGE PROCESSING
     # =========================================================================
@@ -234,11 +310,9 @@ When you receive Word/Excel/PowerPoint comment notifications:
             # Ensure MCP is initialized
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
-            # Process with timeout
+            # Process with timeout and automatic failover on rate limits
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                result = await self.agent.run(message)
-            
-            return self._extract_result(result) or "I couldn't process your request."
+                return await self._run_with_failover(message)
             
         except asyncio.TimeoutError:
             logger.error(f"Processing timeout after {self.PROCESSING_TIMEOUT}s")
@@ -417,9 +491,8 @@ Respond and take any necessary actions."""
             
             try:
                 async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                    result = await self.agent.run(message)
+                    response = await self._run_with_failover(message)
                     
-                response = self._extract_result(result)
                 logger.info(f"📧 Email processed: {response[:100] if response else 'No response'}...")
                 return response or "Email processed."
                 
@@ -473,9 +546,9 @@ INSTRUCTIONS:
 
 Respond appropriately:"""
                 
-                result = await self.agent.run(message)
+                response = await self._run_with_failover(message)
             
-            return self._extract_result(result) or "I've reviewed your comment."
+            return response or "I've reviewed your comment."
             
         except asyncio.TimeoutError:
             return "Sorry, the request took too long. Please try again."
@@ -526,9 +599,9 @@ INSTRUCTIONS:
 
 Respond appropriately:"""
                 
-                result = await self.agent.run(message)
+                response = await self._run_with_failover(message)
             
-            return self._extract_result(result) or "I've reviewed your comment."
+            return response or "I've reviewed your comment."
             
         except asyncio.TimeoutError:
             return "Sorry, the request took too long. Please try again."
@@ -578,9 +651,9 @@ INSTRUCTIONS:
 
 Respond appropriately:"""
                 
-                result = await self.agent.run(message)
+                response = await self._run_with_failover(message)
             
-            return self._extract_result(result) or "I've reviewed your comment."
+            return response or "I've reviewed your comment."
             
         except asyncio.TimeoutError:
             return "Sorry, the request took too long. Please try again."

@@ -21,8 +21,147 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class AzureOpenAIModelConfig:
+    """Configuration for a single Azure OpenAI model deployment."""
+    
+    endpoint: str
+    deployment: str
+    api_key: str
+    api_version: str = "2024-05-01-preview"
+    name: str = ""  # Friendly name for logging
+    
+    def __post_init__(self):
+        if not self.name:
+            self.name = f"{self.deployment}@{self.endpoint.split('//')[1].split('.')[0]}"
+    
+    @property
+    def is_valid(self) -> bool:
+        """Check if settings are valid."""
+        return bool(self.endpoint and self.deployment and self.api_key)
+
+
+class AzureOpenAIModelPool:
+    """
+    Pool of Azure OpenAI models with round-robin load balancing and failover.
+    
+    Automatically rotates through available models and skips throttled ones.
+    """
+    
+    def __init__(self):
+        self.models: list[AzureOpenAIModelConfig] = []
+        self._current_index = 0
+        self._throttled_until: dict[int, float] = {}  # model_index -> timestamp
+        self._load_models_from_env()
+    
+    def _load_models_from_env(self) -> None:
+        """Load all models from environment variables."""
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
+        
+        # Load numbered models (AZURE_OPENAI_MODEL_1_*, AZURE_OPENAI_MODEL_2_*, etc.)
+        for i in range(1, 20):  # Support up to 20 models
+            endpoint = os.getenv(f"AZURE_OPENAI_MODEL_{i}_ENDPOINT")
+            deployment = os.getenv(f"AZURE_OPENAI_MODEL_{i}_DEPLOYMENT")
+            api_key = os.getenv(f"AZURE_OPENAI_MODEL_{i}_API_KEY")
+            
+            if endpoint and deployment and api_key:
+                model = AzureOpenAIModelConfig(
+                    endpoint=endpoint,
+                    deployment=deployment,
+                    api_key=api_key,
+                    api_version=api_version,
+                )
+                self.models.append(model)
+                logger.info(f"📦 Loaded model {i}: {model.name}")
+        
+        # Fallback to legacy single-model config if no numbered models found
+        if not self.models:
+            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+            deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+            api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+            
+            if endpoint and deployment and api_key:
+                model = AzureOpenAIModelConfig(
+                    endpoint=endpoint,
+                    deployment=deployment,
+                    api_key=api_key,
+                    api_version=api_version,
+                )
+                self.models.append(model)
+                logger.info(f"📦 Loaded legacy model: {model.name}")
+        
+        if self.models:
+            logger.info(f"✅ Model pool initialized with {len(self.models)} models")
+        else:
+            logger.warning("⚠️ No Azure OpenAI models configured!")
+    
+    def get_next_model(self) -> AzureOpenAIModelConfig:
+        """
+        Get the next available model using round-robin.
+        Skips models that are currently throttled.
+        """
+        import time
+        
+        if not self.models:
+            raise ValueError("No Azure OpenAI models configured")
+        
+        now = time.time()
+        attempts = 0
+        
+        while attempts < len(self.models):
+            # Check if current model is throttled
+            throttled_until = self._throttled_until.get(self._current_index, 0)
+            
+            if now >= throttled_until:
+                # Model is available
+                model = self.models[self._current_index]
+                self._current_index = (self._current_index + 1) % len(self.models)
+                return model
+            
+            # Model is throttled, try next
+            self._current_index = (self._current_index + 1) % len(self.models)
+            attempts += 1
+        
+        # All models are throttled, return the one with shortest wait
+        min_wait_idx = min(self._throttled_until, key=self._throttled_until.get)
+        wait_time = self._throttled_until[min_wait_idx] - now
+        logger.warning(f"⏳ All models throttled! Shortest wait: {wait_time:.1f}s for {self.models[min_wait_idx].name}")
+        return self.models[min_wait_idx]
+    
+    def mark_throttled(self, model: AzureOpenAIModelConfig, retry_after: float = 60.0) -> None:
+        """Mark a model as throttled for a period of time."""
+        import time
+        
+        try:
+            idx = self.models.index(model)
+            self._throttled_until[idx] = time.time() + retry_after
+            logger.warning(f"🚫 Model {model.name} throttled for {retry_after:.0f}s")
+        except ValueError:
+            pass  # Model not in list
+    
+    def clear_throttle(self, model: AzureOpenAIModelConfig) -> None:
+        """Clear throttle status for a model."""
+        try:
+            idx = self.models.index(model)
+            if idx in self._throttled_until:
+                del self._throttled_until[idx]
+        except ValueError:
+            pass
+    
+    @property
+    def available_count(self) -> int:
+        """Number of models not currently throttled."""
+        import time
+        now = time.time()
+        return sum(1 for i in range(len(self.models)) 
+                   if self._throttled_until.get(i, 0) <= now)
+    
+    def __len__(self) -> int:
+        return len(self.models)
+
+
+@dataclass
 class AzureOpenAISettings:
-    """Azure OpenAI configuration settings."""
+    """Azure OpenAI configuration settings (legacy single-model support)."""
     
     endpoint: str = ""
     deployment: str = ""
@@ -157,6 +296,9 @@ class Settings:
     server: ServerSettings = field(default_factory=ServerSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     
+    # Model pool for load balancing (not a dataclass field - initialized separately)
+    model_pool: Optional[AzureOpenAIModelPool] = field(default=None, repr=False)
+    
     # Development settings
     bearer_token: str = ""
     use_agentic_auth: bool = True
@@ -167,6 +309,9 @@ class Settings:
         self.bearer_token = os.getenv("BEARER_TOKEN", "")
         self.use_agentic_auth = os.getenv("USE_AGENTIC_AUTH", "true").lower() == "true"
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        
+        # Initialize the model pool for multi-model load balancing
+        self.model_pool = AzureOpenAIModelPool()
     
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -198,6 +343,9 @@ class Settings:
         
         # Suppress MCP protocol noise (session IDs, stream reconnects)
         logging.getLogger("mcp.client.streamable_http").setLevel(logging.WARNING)
+        
+        # Suppress OpenAI SDK retry logging (we handle failover ourselves)
+        logging.getLogger("openai._base_client").setLevel(logging.WARNING)
 
 
 # Global singleton settings instance
