@@ -14,10 +14,10 @@ dependencies = [
     "azure-ai-projects>=2.0.0b2",
 
     # Microsoft Agents SDK - Official packages for hosting and integration
-    "microsoft-agents-hosting-aiohttp",
-    "microsoft-agents-hosting-core",
-    "microsoft-agents-authentication-msal",
-    "microsoft-agents-activity",
+    "microsoft-agents-hosting-aiohttp>=0.7.0",
+    "microsoft-agents-hosting-core>=0.7.0",
+    "microsoft-agents-authentication-msal>=0.7.0",
+    "microsoft-agents-activity>=0.7.0",
 
     # Azure SDK components
     "azure-identity",
